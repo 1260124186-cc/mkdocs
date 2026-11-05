@@ -52,6 +52,78 @@ function displayResults (results) {
   }
 }
 
+// Present when the build publishes per-chapter search shards.
+var shardInfo = null;
+
+function postToWorker (message) {
+  if (window.Worker) {
+    searchWorker.postMessage(message);
+  }
+}
+
+function setSearchScope (value) {
+  if (!shardInfo) {
+    return;
+  }
+  if (value === '__all__') {
+    postToWorker({allShards: true});
+  } else if (value === '__current__') {
+    if (shardInfo.current) {
+      postToWorker({shard: shardInfo.current});
+    } else {
+      postToWorker({allShards: true});
+    }
+  } else {
+    postToWorker({shard: value});
+  }
+}
+
+function initShardSelector (info) {
+  shardInfo = info;
+  var search_input = document.getElementById('mkdocs-search-query');
+  if (!search_input || !info.list || !info.list.length) {
+    return;
+  }
+  if (document.getElementById('mkdocs-search-shard-scope')) {
+    return;
+  }
+
+  var select = document.createElement('select');
+  select.id = 'mkdocs-search-shard-scope';
+  select.title = "Search scope";
+  select.className = search_input.className;
+
+  function addOption (value, label, selected) {
+    var option = document.createElement('option');
+    option.value = value;
+    option.text = label;
+    if (selected) {
+      option.selected = true;
+    }
+    select.appendChild(option);
+  }
+
+  var currentMeta = null;
+  for (var i=0; i < info.list.length; i++) {
+    if (info.list[i].slug === info.current) {
+      currentMeta = info.list[i];
+    }
+  }
+
+  addOption('__current__', (currentMeta ? currentMeta.title : 'This section'), !!info.current);
+  addOption('__all__', 'All sections', !info.current);
+  for (var j=0; j < info.list.length; j++) {
+    if (info.list[j].slug !== info.current) {
+      addOption(info.list[j].slug, info.list[j].title, false);
+    }
+  }
+
+  select.addEventListener("change", function () {
+    setSearchScope(select.value);
+  });
+  search_input.insertAdjacentElement('afterend', select);
+}
+
 function doSearch () {
   var query = document.getElementById('mkdocs-search-query').value;
   if (query.length > min_search_length) {
@@ -86,6 +158,13 @@ function onWorkerMessage (e) {
     displayResults(results);
   } else if (e.data.config) {
     min_search_length = e.data.config.min_search_length-1;
+  } else if (e.data.shards) {
+    initShardSelector(e.data.shards);
+  } else if (e.data.shardReady) {
+    // The requested chapter indexes finished loading; refresh current results.
+    if (document.getElementById('mkdocs-search-query')) {
+      doSearch();
+    }
   }
 }
 
@@ -104,6 +183,6 @@ if (!window.Worker) {
 } else {
   // Wrap search in a web worker
   var searchWorker = new Worker(joinUrl(base_url, "search/worker.js"));
-  searchWorker.postMessage({init: true});
+  searchWorker.postMessage({init: true, page: window.location.pathname});
   searchWorker.onmessage = onWorkerMessage;
 }

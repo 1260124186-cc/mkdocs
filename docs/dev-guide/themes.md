@@ -794,12 +794,52 @@ created if the user explicitly enables the [prebuild_index] config option.
 Themes should expect the index to not be present, but can choose to use the
 index when it is available. The `index` object was new in MkDocs version *1.0*.
 
+### Search index shards
+
+When the [shard_index] config option is enabled, the search index is
+additionally split into one shard per top-level navigation chapter. Each shard
+file under `search/shards/` contains the same JSON structure as
+`search/search_index.json`, and the full index is always published alongside
+the shards so that themes which do not support shards keep working.
+
+The `search/shards/manifest.json` manifest lists every shard of the current
+build. Its `docs` count equals the number of documents in the full index, and
+its `config` object is identical, so a theme can verify that both come from the
+same build. Each shard entry contains its `slug`, human readable `title`,
+`location` relative to the `search/` directory, the number of `docs` and the
+page `locations` covered by the shard.
+
+```json
+{
+    config: {...},
+    index: "search_index.json",
+    docs: 42,
+    shards: [
+        {
+            slug: "user-guide",
+            title: "User Guide",
+            location: "shards/user-guide.json",
+            docs: 20,
+            locations: ["user-guide/"]
+        }
+    ]
+}
+```
+
+A theme can fetch the manifest first, load individual shard indexes lazily and
+combine their search results. Because the manifest and the shard files are
+published atomically, a theme either observes the complete set of one build or
+the complete set of the previous build; a missing manifest should be treated as
+"sharding is disabled" and the theme should fall back to
+`search/search_index.json`.
+
 [Jinja2 template]: https://jinja.palletsprojects.com/
 [built-in themes]: https://github.com/mkdocs/mkdocs/tree/master/mkdocs/themes
 [theme's configuration file]: #theme-configuration
 [lunr.js]: https://lunrjs.com/
 [site_dir]: ../user-guide/configuration.md#site_dir
 [prebuild_index]: ../user-guide/configuration.md#prebuild_index
+[shard_index]: ../user-guide/configuration.md#shard_index
 [Jinja's default filters]: https://jinja.palletsprojects.com/en/latest/templates/#builtin-filters
 
 ## Packaging Themes

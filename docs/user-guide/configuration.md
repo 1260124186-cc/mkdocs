@@ -1065,6 +1065,26 @@ Option | Description
 
 **default**: `full`
 
+##### **shard_index**
+
+In addition to the full `search/search_index.json`, publish one search index
+shard per top-level navigation chapter under `search/shards/`, together with a
+`search/shards/manifest.json` manifest. The theme can then download chapter
+indexes lazily instead of fetching the whole index on every page, while the
+full index keeps being published for compatibility with older themes. Shard
+file names are stable for as long as the chapter title is unchanged. The
+manifest, the shards and the full index are always published as one consistent
+set and shard files from chapters that were renamed, deleted or lost pages are
+removed, so rebuilds never leave mixed versions behind.
+
+```yaml
+plugins:
+  - search:
+      shard_index: true
+```
+
+**default**: `False`
+
 ## Special YAML tags
 
 ### Environment variables

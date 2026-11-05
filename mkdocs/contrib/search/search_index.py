@@ -21,6 +21,10 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
+# Shard used for entries that do not belong to any top-level navigation
+# section, i.e. top-level pages and pages that are not part of the nav.
+ROOT_SHARD = 'root'
+
 
 class SearchIndex:
     """
@@ -30,7 +34,24 @@ class SearchIndex:
 
     def __init__(self, **config) -> None:
         self._entries: list[dict] = []
+        # The shard that each entry belongs to, parallel to `self._entries`.
+        self._entry_shards: list[str] = []
         self.config = config
+
+    @property
+    def shards(self) -> list[str]:
+        """The shards that contain entries, in order of first appearance."""
+        return list(dict.fromkeys(self._entry_shards))
+
+    def shard_entries(self) -> dict[str, list[dict]]:
+        """
+        Group the collected entries by shard slug, preserving the order in
+        which the shards and the entries within each shard were collected.
+        """
+        shards: dict[str, list[dict]] = {}
+        for shard, entry in zip(self._entry_shards, self._entries):
+            shards.setdefault(shard, []).append(entry)
+        return shards
 
     def _find_toc_by_id(self, toc, id_: str | None) -> AnchorLink | None:
         """
@@ -45,18 +66,25 @@ class SearchIndex:
                 return toc_item_r
         return None
 
-    def _add_entry(self, title: str | None, text: str, loc: str) -> None:
+    def _add_entry(
+        self, title: str | None, text: str, loc: str, shard: str = ROOT_SHARD
+    ) -> None:
         """A simple wrapper to add an entry, dropping bad characters."""
         text = text.replace('\u00a0', ' ')
         text = re.sub(r'[ \t\n\r\f\v]+', ' ', text.strip())
 
         self._entries.append({'title': title, 'text': text, 'location': loc})
+        self._entry_shards.append(shard)
 
-    def add_entry_from_context(self, page: Page) -> None:
+    def add_entry_from_context(self, page: Page, shard: str = ROOT_SHARD) -> None:
         """
         Create a set of entries in the index for a page. One for
         the page itself and then one for each of its' heading
         tags.
+
+        All entries created for the page are assigned to the given shard,
+        identified by the stable slug of the top-level nav section the page
+        belongs to.
         """
         # Create the content parser and feed in the HTML for the
         # full page. This handles all the parsing and prepares
@@ -72,14 +100,18 @@ class SearchIndex:
 
         # Create an entry for the full page.
         text = parser.stripped_html.rstrip('\n') if self.config['indexing'] == 'full' else ''
-        self._add_entry(title=page.title, text=text, loc=url)
+        self._add_entry(title=page.title, text=text, loc=url, shard=shard)
 
         if self.config['indexing'] in ['full', 'sections']:
             for section in parser.data:
-                self.create_entry_for_section(section, page.toc, url)
+                self.create_entry_for_section(section, page.toc, url, shard)
 
     def create_entry_for_section(
-        self, section: ContentSection, toc: TableOfContents, abs_url: str
+        self,
+        section: ContentSection,
+        toc: TableOfContents,
+        abs_url: str,
+        shard: str = ROOT_SHARD,
     ) -> None:
         """
         Given a section on the page, the table of contents and
@@ -90,11 +122,21 @@ class SearchIndex:
 
         text = ' '.join(section.text) if self.config['indexing'] == 'full' else ''
         if toc_item is not None:
-            self._add_entry(title=toc_item.title, text=text, loc=abs_url + toc_item.url)
+            self._add_entry(
+                title=toc_item.title, text=text, loc=abs_url + toc_item.url, shard=shard
+            )
 
     def generate_search_index(self) -> str:
-        """Python to json conversion."""
-        page_dicts = {'docs': self._entries, 'config': self.config}
+        """Python to json conversion of the full index."""
+        return self._generate_search_index(self._entries)
+
+    def generate_shard_search_index(self, shard: str) -> str:
+        """Python to json conversion of a single top-level chapter shard."""
+        return self._generate_search_index(self.shard_entries()[shard])
+
+    def _generate_search_index(self, entries: list[dict]) -> str:
+        """Render the given entries to a search index JSON document."""
+        page_dicts = {'docs': entries, 'config': self.config}
         data = json.dumps(page_dicts, sort_keys=True, separators=(',', ':'), default=str)
 
         if self.config['prebuild_index'] in (True, 'node'):
@@ -123,7 +165,7 @@ class SearchIndex:
                 lunr_idx = lunr(
                     ref='location',
                     fields=('title', 'text'),
-                    documents=self._entries,
+                    documents=entries,
                     languages=self.config['lang'],
                 )
                 page_dicts['index'] = lunr_idx.serialize()

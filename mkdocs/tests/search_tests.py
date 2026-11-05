@@ -1,16 +1,19 @@
 #!/usr/bin/env python
 
 import json
+import os
 import unittest
 from unittest import mock
 
+from mkdocs.commands import build
 from mkdocs.config.config_options import ValidationError
 from mkdocs.contrib import search
 from mkdocs.contrib.search import search_index
-from mkdocs.structure.files import File
+from mkdocs.structure.files import File, get_files
+from mkdocs.structure.nav import get_navigation
 from mkdocs.structure.pages import Page
 from mkdocs.structure.toc import get_toc
-from mkdocs.tests.base import dedent, get_markdown_toc, load_config
+from mkdocs.tests.base import PathAssertionMixin, dedent, get_markdown_toc, load_config, tempdir
 
 
 def strip_whitespace(string):
@@ -82,6 +85,7 @@ class SearchPluginTests(unittest.TestCase):
             'min_search_length': 3,
             'prebuild_index': False,
             'indexing': 'full',
+            'shard_index': False,
         }
         plugin = search.SearchPlugin()
         errors, warnings = plugin.load_config({})
@@ -96,6 +100,7 @@ class SearchPluginTests(unittest.TestCase):
             'min_search_length': 3,
             'prebuild_index': False,
             'indexing': 'full',
+            'shard_index': False,
         }
         plugin = search.SearchPlugin()
         errors, warnings = plugin.load_config({'lang': 'es'})
@@ -110,6 +115,7 @@ class SearchPluginTests(unittest.TestCase):
             'min_search_length': 3,
             'prebuild_index': False,
             'indexing': 'full',
+            'shard_index': False,
         }
         plugin = search.SearchPlugin()
         errors, warnings = plugin.load_config({'separator': r'[\s\-\.]+'})
@@ -124,6 +130,7 @@ class SearchPluginTests(unittest.TestCase):
             'min_search_length': 2,
             'prebuild_index': False,
             'indexing': 'full',
+            'shard_index': False,
         }
         plugin = search.SearchPlugin()
         errors, warnings = plugin.load_config({'min_search_length': 2})
@@ -138,6 +145,7 @@ class SearchPluginTests(unittest.TestCase):
             'min_search_length': 3,
             'prebuild_index': True,
             'indexing': 'full',
+            'shard_index': False,
         }
         plugin = search.SearchPlugin()
         errors, warnings = plugin.load_config({'prebuild_index': True})
@@ -152,9 +160,25 @@ class SearchPluginTests(unittest.TestCase):
             'min_search_length': 3,
             'prebuild_index': False,
             'indexing': 'titles',
+            'shard_index': False,
         }
         plugin = search.SearchPlugin()
         errors, warnings = plugin.load_config({'indexing': 'titles'})
+        self.assertEqual(plugin.config, expected)
+        self.assertEqual(errors, [])
+        self.assertEqual(warnings, [])
+
+    def test_plugin_config_shard_index(self):
+        expected = {
+            'lang': None,
+            'separator': r'[\s\-]+',
+            'min_search_length': 3,
+            'prebuild_index': False,
+            'indexing': 'full',
+            'shard_index': True,
+        }
+        plugin = search.SearchPlugin()
+        errors, warnings = plugin.load_config({'shard_index': True})
         self.assertEqual(plugin.config, expected)
         self.assertEqual(errors, [])
         self.assertEqual(warnings, [])
@@ -631,3 +655,425 @@ class SearchIndexTests(unittest.TestCase):
         self.assertEqual(mock_popen.call_count, 1)
         self.assertEqual(mock_popen_obj.communicate.call_count, 1)
         self.assertEqual(result, expected)
+
+
+class ShardSlugTests(unittest.TestCase):
+    def test_ascii_title(self):
+        self.assertEqual(search.slugify_shard('User Guide'), 'user-guide')
+
+    def test_accents_and_case(self):
+        self.assertEqual(search.slugify_shard('Ünited States'), 'united-states')
+
+    def test_punctuation_collapses_to_single_separator(self):
+        self.assertEqual(search.slugify_shard('a---b / c!!!'), 'a-b-c')
+
+    def test_non_ascii_falls_back_to_stable_hash(self):
+        slug = search.slugify_shard('用户指南')
+        # Stable across builds, 12 hex characters, file-system safe.
+        self.assertEqual(slug, search.slugify_shard('用户指南'))
+        self.assertRegex(slug, r'^[0-9a-f]{12}$')
+
+    def test_hash_changes_when_title_changes(self):
+        self.assertNotEqual(search.slugify_shard('用户指南'), search.slugify_shard('开发指南'))
+
+
+class SearchIndexShardTests(unittest.TestCase):
+    def _make_pages(self, base_cfg):
+        html_content = """
+        <h1 id="heading-1">Heading 1</h1>
+        <p>Content 1</p>
+        """
+        md = dedent(
+            """
+            # Heading 1
+            """
+        )
+        return [
+            Page(
+                'Home',
+                File('index.md', base_cfg.docs_dir, base_cfg.site_dir, base_cfg.use_directory_urls),
+                base_cfg,
+            ),
+            Page(
+                'About',
+                File('about.md', base_cfg.docs_dir, base_cfg.site_dir, base_cfg.use_directory_urls),
+                base_cfg,
+            ),
+            html_content,
+            md,
+        ]
+
+    def test_entries_default_to_root_shard(self):
+        base_cfg = load_config()
+        pages = self._make_pages(base_cfg)
+        page1, page2, html_content, md = pages
+        toc = get_toc(get_markdown_toc(md))
+        plugin = search.SearchPlugin()
+        plugin.load_config({})
+        index = search_index.SearchIndex(**plugin.config)
+        for page in (page1, page2):
+            page.content = html_content
+            page.toc = toc
+            index.add_entry_from_context(page)
+        self.assertEqual(index.shards, [search_index.ROOT_SHARD])
+        self.assertEqual(
+            sorted(index.shard_entries()), [search_index.ROOT_SHARD]
+        )
+
+    def test_entries_grouped_by_shard_and_rendered_separately(self):
+        base_cfg = load_config()
+        pages = self._make_pages(base_cfg)
+        page1, page2, html_content, md = pages
+        toc = get_toc(get_markdown_toc(md))
+
+        plugin = search.SearchPlugin()
+        plugin.load_config({})
+        index = search_index.SearchIndex(**plugin.config)
+
+        page1.content = html_content
+        page1.toc = toc
+        page2.content = html_content
+        page2.toc = toc
+        index.add_entry_from_context(page1, shard='alpha-guide')
+        index.add_entry_from_context(page2, shard='beta-guide')
+
+        shard_entries = index.shard_entries()
+        self.assertEqual(list(shard_entries), ['alpha-guide', 'beta-guide'])
+        self.assertEqual(len(shard_entries['alpha-guide']), 2)
+        self.assertEqual(len(shard_entries['beta-guide']), 2)
+
+        alpha = json.loads(index.generate_shard_search_index('alpha-guide'))
+        beta = json.loads(index.generate_shard_search_index('beta-guide'))
+        full = json.loads(index.generate_search_index())
+        self.assertEqual({e['location'] for e in alpha['docs']}, {page1.url, f'{page1.url}#heading-1'})
+        self.assertEqual({e['location'] for e in beta['docs']}, {page2.url, f'{page2.url}#heading-1'})
+        self.assertEqual(len(full['docs']), 4)
+        # Shard and full documents share the same config snapshot.
+        self.assertEqual(alpha['config'], full['config'])
+        self.assertEqual(beta['config'], full['config'])
+
+
+class SearchShardPluginTests(PathAssertionMixin, unittest.TestCase):
+    DOCS = {
+        'index.md': '# Home\n\nwelcome home content',
+        'alpha/a1.md': '# A1\n\nalpha one content',
+        'alpha/a2.md': '# A2\n\nalpha two content',
+        'beta/b1.md': '# B1\n\nbeta bananas content',
+    }
+
+    NAV = [
+        {'Home': 'index.md'},
+        {'Alpha Guide': [{'A1': 'alpha/a1.md'}, {'A2': 'alpha/a2.md'}]},
+        {'Beta Guide': [{'B1': 'beta/b1.md'}]},
+    ]
+
+    def _run_build(self, docs_dir, site_dir, nav_cfg, options=None):
+        cfg = load_config(
+            docs_dir=docs_dir,
+            site_dir=site_dir,
+            nav=nav_cfg,
+            theme='mkdocs',
+        )
+        files = get_files(cfg)
+        nav = get_navigation(files, cfg)
+        plugin = search.SearchPlugin()
+        plugin.load_config(options if options is not None else {'shard_index': True})
+        plugin.on_config(cfg)
+        plugin.on_pre_build(cfg)
+        for file in files.documentation_pages():
+            page = file.page
+            # Minimal rendered page: one heading without a matching TOC entry,
+            # so every page contributes exactly one search index entry.
+            page.content = '<h1 id="topic">Topic</h1><p>page body content</p>'
+            page.toc = ()
+            plugin.on_page_context({}, page=page, config=cfg, nav=nav)
+        plugin.on_post_build(cfg)
+        return plugin, cfg
+
+    def _outputs(self, site_dir):
+        search_dir = os.path.join(site_dir, 'search')
+        shards_dir = os.path.join(search_dir, 'shards')
+        with open(os.path.join(shards_dir, 'manifest.json'), encoding='utf-8') as f:
+            manifest = json.load(f)
+        shard_docs = {}
+        for shard in manifest['shards']:
+            with open(os.path.join(shards_dir, os.path.basename(shard['location'])), encoding='utf-8') as f:
+                shard_docs[shard['slug']] = json.load(f)['docs']
+        with open(os.path.join(search_dir, 'search_index.json'), encoding='utf-8') as f:
+            full = json.load(f)
+        return search_dir, shards_dir, manifest, shard_docs, full
+
+    def _snapshot(self, search_dir):
+        shards_dir = os.path.join(search_dir, 'shards')
+        return (
+            {name: open(os.path.join(shards_dir, name), 'rb').read() for name in os.listdir(shards_dir)},
+            open(os.path.join(search_dir, 'search_index.json'), 'rb').read(),
+        )
+
+    @tempdir(files=DOCS)
+    @tempdir()
+    def test_shard_outputs_and_same_round_consistency(self, site_dir, docs_dir):
+        self._run_build(docs_dir, site_dir, self.NAV)
+        search_dir, shards_dir, manifest, shard_docs, full = self._outputs(site_dir)
+
+        # The full index is still published unchanged for themes that use it.
+        self.assertPathIsFile(search_dir, 'search_index.json')
+        # Exactly the manifest and one shard per chapter, nothing stale.
+        self.assertEqual(
+            sorted(os.listdir(shards_dir)),
+            ['alpha-guide.json', 'beta-guide.json', 'manifest.json', 'root.json'],
+        )
+        self.assertFalse(any(name.startswith('.') for name in os.listdir(search_dir)))
+
+        # Manifest and full index describe the same build round.
+        self.assertEqual(manifest['config'], full['config'])
+        self.assertEqual(manifest['docs'], len(full['docs']))
+        self.assertEqual(sum(s['docs'] for s in manifest['shards']), len(full['docs']))
+
+        by_slug = {s['slug']: s for s in manifest['shards']}
+        self.assertEqual(by_slug['alpha-guide']['title'], 'Alpha Guide')
+        self.assertEqual(by_slug['beta-guide']['title'], 'Beta Guide')
+        self.assertEqual(by_slug['root']['title'], 'Root')
+        # The manifest points at files that actually exist.
+        for shard in manifest['shards']:
+            self.assertPathIsFile(shards_dir, os.path.basename(shard['location']))
+            self.assertEqual(shard['docs'], len(shard_docs[shard['slug']]))
+
+        # Pages are assigned to their top-level chapter.
+        self.assertEqual(
+            by_slug['alpha-guide']['locations'], ['alpha/a1/', 'alpha/a2/']
+        )
+        self.assertEqual(by_slug['beta-guide']['locations'], ['beta/b1/'])
+        self.assertEqual(by_slug['root']['locations'], [''])
+        for entry in shard_docs['alpha-guide']:
+            self.assertTrue(entry['location'].startswith('alpha/'))
+        for entry in shard_docs['beta-guide']:
+            self.assertTrue(entry['location'].startswith('beta/'))
+
+        # The shards partition the full index without overlap or loss.
+        shard_locations = sorted(
+            entry['location']
+            for docs in shard_docs.values()
+            for entry in docs
+        )
+        full_locations = sorted(entry['location'] for entry in full['docs'])
+        self.assertEqual(shard_locations, full_locations)
+
+    @tempdir(files=DOCS)
+    @tempdir()
+    def test_shard_slug_titles(self, site_dir, docs_dir):
+        plugin, _ = self._run_build(docs_dir, site_dir, self.NAV)
+        self.assertEqual(
+            plugin._shard_titles,
+            {'alpha-guide': 'Alpha Guide', 'beta-guide': 'Beta Guide'},
+        )
+
+    @tempdir(files=DOCS)
+    @tempdir()
+    def test_rename_delete_and_move_reconcile_old_shards(self, site_dir, docs_dir):
+        self._run_build(docs_dir, site_dir, self.NAV)
+        renamed_nav = [
+            {'Home': 'index.md'},
+            # Alpha chapter renamed; the Beta chapter deleted and its page
+            # moved underneath the renamed chapter.
+            {
+                'Alpha Handbook': [
+                    {'A1': 'alpha/a1.md'},
+                    {'A2': 'alpha/a2.md'},
+                    {'Moved B1': 'beta/b1.md'},
+                ]
+            },
+        ]
+        self._run_build(docs_dir, site_dir, renamed_nav)
+        search_dir, shards_dir, manifest, shard_docs, full = self._outputs(site_dir)
+
+        # Old chapter shards (rename + delete) are gone; no mixed versions.
+        self.assertEqual(
+            sorted(os.listdir(shards_dir)),
+            ['alpha-handbook.json', 'manifest.json', 'root.json'],
+        )
+        self.assertFalse(any(name.startswith('.') for name in os.listdir(search_dir)))
+
+        handbook = next(s for s in manifest['shards'] if s['slug'] == 'alpha-handbook')
+        self.assertEqual(
+            handbook['locations'], ['alpha/a1/', 'alpha/a2/', 'beta/b1/']
+        )
+        # The moved page exists only in the new chapter's shard.
+        handbook_locations = [e['location'] for e in shard_docs['alpha-handbook']]
+        self.assertTrue(any(loc.startswith('beta/b1') for loc in handbook_locations))
+        self.assertEqual(
+            [loc for loc in handbook_locations if loc.startswith('beta/b1')],
+            ['beta/b1/'],
+        )
+        # The full index from the same round still lists the moved page once.
+        self.assertEqual(
+            sorted(e['location'] for e in full['docs']),
+            ['', 'alpha/a1/', 'alpha/a2/', 'beta/b1/'],
+        )
+        self.assertEqual(manifest['docs'], len(full['docs']))
+
+    @tempdir(files=DOCS)
+    @tempdir()
+    def test_repeated_builds_do_not_leave_mixed_versions(self, site_dir, docs_dir):
+        self._run_build(docs_dir, site_dir, self.NAV)
+        search_dir = os.path.join(site_dir, 'search')
+        before_shards, before_full = self._snapshot(search_dir)
+        self._run_build(docs_dir, site_dir, self.NAV)
+        after_shards, after_full = self._snapshot(search_dir)
+
+        self.assertEqual(set(before_shards), set(after_shards))
+        self.assertEqual(before_shards, after_shards)
+        self.assertEqual(before_full, after_full)
+        self.assertFalse(
+            any(name.startswith('.') for name in os.listdir(search_dir)),
+            os.listdir(search_dir),
+        )
+
+    @tempdir(files=DOCS)
+    @tempdir()
+    def test_failed_generation_keeps_previous_index_set_intact(self, site_dir, docs_dir):
+        _, cfg = self._run_build(docs_dir, site_dir, self.NAV)
+        search_dir = os.path.join(site_dir, 'search')
+        before_shards, before_full = self._snapshot(search_dir)
+
+        files = get_files(cfg)
+        nav = get_navigation(files, cfg)
+        plugin = search.SearchPlugin()
+        plugin.load_config({'shard_index': True})
+        plugin.on_config(cfg)
+        plugin.on_pre_build(cfg)
+        for file in files.documentation_pages():
+            page = file.page
+            page.content = '<h1 id="topic">Topic</h1><p>page body content</p>'
+            page.toc = ()
+            plugin.on_page_context({}, page=page, config=cfg, nav=nav)
+
+        with mock.patch.object(
+            plugin.search_index, 'generate_search_index', side_effect=RuntimeError('boom')
+        ):
+            with self.assertRaises(RuntimeError):
+                plugin.on_post_build(cfg)
+
+        after_shards, after_full = self._snapshot(search_dir)
+        self.assertEqual(after_shards, before_shards)
+        self.assertEqual(after_full, before_full)
+        self.assertFalse(any(name.startswith('.') for name in os.listdir(search_dir)))
+
+    @tempdir(files=DOCS)
+    @tempdir()
+    def test_failed_staging_write_keeps_previous_index_set_intact(self, site_dir, docs_dir):
+        _, cfg = self._run_build(docs_dir, site_dir, self.NAV)
+        search_dir = os.path.join(site_dir, 'search')
+        before_shards, _ = self._snapshot(search_dir)
+
+        files = get_files(cfg)
+        nav = get_navigation(files, cfg)
+        plugin = search.SearchPlugin()
+        plugin.load_config({'shard_index': True})
+        plugin.on_config(cfg)
+        plugin.on_pre_build(cfg)
+        for file in files.documentation_pages():
+            page = file.page
+            page.content = '<h1 id="topic">Topic</h1><p>page body content</p>'
+            page.toc = ()
+            plugin.on_page_context({}, page=page, config=cfg, nav=nav)
+
+        real_write_file = search.utils.write_file
+        state = {'count': 0}
+
+        def flaky_write_file(content, output_path):
+            state['count'] += 1
+            if state['count'] == 2:
+                raise OSError('simulated staging failure')
+            return real_write_file(content, output_path)
+
+        with mock.patch.object(search.utils, 'write_file', flaky_write_file):
+            with self.assertRaises(OSError):
+                plugin.on_post_build(cfg)
+
+        after_shards, _ = self._snapshot(search_dir)
+        self.assertEqual(after_shards, before_shards)
+        self.assertFalse(any(name.startswith('.') for name in os.listdir(search_dir)))
+
+    @tempdir(files=DOCS)
+    @tempdir()
+    def test_disabling_sharding_retires_shard_directory(self, site_dir, docs_dir):
+        self._run_build(docs_dir, site_dir, self.NAV)
+        search_dir = os.path.join(site_dir, 'search')
+        self.assertPathIsDir(search_dir, 'shards')
+
+        self._run_build(docs_dir, site_dir, self.NAV, options={})
+        self.assertPathNotExists(search_dir, 'shards')
+        self.assertPathIsFile(search_dir, 'search_index.json')
+        self.assertFalse(any(name.startswith('.') for name in os.listdir(search_dir)))
+
+    @tempdir(files=DOCS)
+    @tempdir()
+    def test_identically_titled_chapters_get_distinct_stable_shards(self, site_dir, docs_dir):
+        nav_cfg = [
+            {'Home': 'index.md'},
+            {'Guide': [{'A1': 'alpha/a1.md'}]},
+            {'Guide': [{'B1': 'beta/b1.md'}]},
+        ]
+        self._run_build(docs_dir, site_dir, nav_cfg)
+        shards_dir = os.path.join(site_dir, 'search', 'shards')
+        first = set(os.listdir(shards_dir))
+        self.assertIn('guide.json', first)
+        self.assertIn('guide-2.json', first)
+
+        # A repeated build allocates the same slugs; the assignment is stable.
+        self._run_build(docs_dir, site_dir, nav_cfg)
+        self.assertEqual(set(os.listdir(shards_dir)), first)
+
+    @tempdir(files=DOCS)
+    @tempdir()
+    def test_non_ascii_chapter_title_gets_stable_shard(self, site_dir, docs_dir):
+        nav_cfg = [
+            {'Home': 'index.md'},
+            {'指南': [{'A1': 'alpha/a1.md'}, {'A2': 'alpha/a2.md'}]},
+        ]
+        self._run_build(docs_dir, site_dir, nav_cfg)
+        shards_dir = os.path.join(site_dir, 'search', 'shards')
+        slug = search.slugify_shard('指南')
+        self.assertPathIsFile(shards_dir, f'{slug}.json')
+        first = set(os.listdir(shards_dir))
+        self._run_build(docs_dir, site_dir, nav_cfg)
+        self.assertEqual(set(os.listdir(shards_dir)), first)
+
+    @tempdir(
+        files={
+            'index.md': '# Home\n\nhome content',
+            'guide/install.md': '# Install\n\ninstall content',
+            'about/license.md': '# License\n\nlicense content',
+        }
+    )
+    @tempdir()
+    def test_full_build_publishes_consistent_shard_set(self, site_dir, docs_dir):
+        nav_cfg = [
+            {'Home': 'index.md'},
+            {'Guide': [{'Install': 'guide/install.md'}]},
+            {'About': [{'License': 'about/license.md'}]},
+        ]
+        cfg = load_config(
+            docs_dir=docs_dir,
+            site_dir=site_dir,
+            theme='mkdocs',
+            plugins=[{'search': {'shard_index': True}}],
+            nav=nav_cfg,
+        )
+        build.build(cfg)
+
+        search_dir = os.path.join(site_dir, 'search')
+        self.assertPathIsFile(search_dir, 'search_index.json')
+        shards_dir = os.path.join(search_dir, 'shards')
+        self.assertEqual(
+            sorted(os.listdir(shards_dir)),
+            ['about.json', 'guide.json', 'manifest.json', 'root.json'],
+        )
+        with open(os.path.join(shards_dir, 'manifest.json'), encoding='utf-8') as f:
+            manifest = json.load(f)
+        with open(os.path.join(search_dir, 'search_index.json'), encoding='utf-8') as f:
+            full = json.load(f)
+        self.assertEqual(manifest['config'], full['config'])
+        self.assertEqual(manifest['docs'], len(full['docs']))
+        self.assertEqual(sum(s['docs'] for s in manifest['shards']), len(full['docs']))
