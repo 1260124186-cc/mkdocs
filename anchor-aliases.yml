@@ -1,0 +1,21 @@
+# Anchor aliases for renamed headings.
+#
+# Maps each documentation page (path relative to docs/, as used in `nav`) to a
+# mapping of OLD anchor id -> CURRENT anchor id. Old links containing the former
+# anchor keep scrolling to the renamed section. Aliases may point at other
+# aliases, but every chain must end at a heading or manually set anchor that
+# exists on the page.
+#
+# The build aborts when an alias is listed more than once, collides with an
+# anchor the page already defines, points at a missing anchor, or forms a cycle.
+# Removing an entry (or renaming/deleting its page) removes the alias on the
+# next build.
+#
+# Example:
+#
+# user-guide/configuration.md:
+#   old-section: the-renamed-section
+#   legacy-name: intermediate-name
+#   intermediate-name: the-renamed-section
+
+{}
